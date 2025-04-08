@@ -184,12 +184,12 @@ def get_basic_battery_parameters():
     with col1:
         max_capacity = st.number_input(
             "Valitse akun kapasiteetti (kWh)", 
-            min_value=0, max_value=200, value=10, key="basic_capacity_tab"
+            min_value=0, max_value=1000, value=10, key="basic_capacity_tab"
         )
     with col2:
         max_charge_rate = st.number_input(
             "Valitse akun latausnopeus (kWh)", 
-            min_value=0, max_value=25, value=10, key="basic_charge_rate_tab"
+            min_value=0, value=10, key="basic_charge_rate_tab"
         )
     with col3:
         battery_price = st.number_input(
