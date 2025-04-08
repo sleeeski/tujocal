@@ -381,23 +381,18 @@ def simulate_reserve_battery(merged_df, max_capacity, max_charge_rate, reserve_c
         charges = []
         costs = []
         for row in df.iter_rows(named=True):
-            if current_charge < reserve_capacity:
-                charge_amount = min(max_charge_rate, reserve_capacity - current_charge)
+            if row["price"] < price_limit and current_charge < max_capacity:
+                charge_amount = min(max_charge_rate - reserve_capacity, max_capacity - current_charge)
                 current_charge += charge_amount
                 cost = row["cost_for_reserve"] + charge_amount * row["price"]
-            elif row["price"] < price_limit and current_charge < max_capacity:
-                charge_amount = min(max_charge_rate, max_capacity - current_charge)
-                current_charge += charge_amount
-                cost = row["cost_for_reserve"] + charge_amount * row["price"]
-            elif current_charge > reserve_capacity:
-                discharge_amount = min(row["consumption"], current_charge - reserve_capacity)
+            elif current_charge > 0:
+                discharge_amount = min(row["consumption"], current_charge)
                 current_charge -= discharge_amount
                 cost = row["cost_for_reserve"] - discharge_amount * row["price"]
             else:
                 cost = row["cost_for_reserve"]
             
-            if current_charge >= reserve_capacity:
-                cost -= reserve_capacity * row["reserve_prices"]
+            cost -= reserve_capacity * row["reserve_prices"]
             
             charges.append(current_charge)
             costs.append(cost)
