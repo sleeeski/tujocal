@@ -188,7 +188,7 @@ def get_basic_battery_parameters():
         )
     with col2:
         max_charge_rate = st.number_input(
-            "Valitse akun latausnopeus (kWh)", 
+            "Valitse akun teho (kW)", 
             min_value=0, value=10, key="basic_charge_rate_tab"
         )
     with col3:
@@ -359,7 +359,7 @@ def create_basic_battery_chart(df, battery_price):
 def get_reserve_battery_parameters(max_capacity):
     """Get reserve capacity for reserve simulation."""
     reserve_capacity = st.number_input(
-        "Valitse reservikapasiteetti (kWh)", 
+        "Valitse reservikapasiteetti (kW)", 
         min_value=0, max_value=max_capacity, value=max_capacity, key="reserve_amount_tab"
     )
     return reserve_capacity
