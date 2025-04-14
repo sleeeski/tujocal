@@ -13,7 +13,7 @@ def load_data(consumption_file):
         
         consumption_df = consumption_df.select([
             pl.col(consumption_df.columns[0]).alias("time_stamp"),
-            pl.col(consumption_df.columns[1]).alias("consumption")
+            pl.col(consumption_df.columns[2]).alias("consumption")
         ])
         
         price_df = pl.read_csv("electricity_prices.csv")
