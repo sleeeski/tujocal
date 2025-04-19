@@ -202,7 +202,7 @@ def get_basic_battery_parameters():
 def simulate_basic_battery(merged_df, max_capacity, max_charge_rate):
     """Simulate basic battery charging and discharging strategy using Polars."""
     df = merged_df.clone()
-    price_limit = 2.12   # df["price"].mean() * 0.5
+    price_limit = df["price"].mean() * 0.5
     initial_charge = 0.0
     
     df = df.with_columns([
