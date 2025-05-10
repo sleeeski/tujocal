@@ -1,54 +1,130 @@
 import streamlit as st
 import polars as pl
+import numpy as np
 import plotly.express as px
+from datetime import timedelta
+from pulp import LpProblem, LpMinimize, LpVariable, lpSum, PULP_CBC_CMD
 
+# Set page configuration
+st.set_page_config(page_title="Battery Savings Simulator", layout="wide")
 
-def load_data(consumption_file):
-    """Load and merge all necessary data files using Polars."""
+# Initialize session state for file uploads and calculations
+if 'uploaded_file_tab1' not in st.session_state:
+    st.session_state.uploaded_file_tab1 = None
+if 'uploaded_file_tab2' not in st.session_state:
+    st.session_state.uploaded_file_tab2 = None
+if 'uploaded_file_tab3' not in st.session_state:
+    st.session_state.uploaded_file_tab3 = None
+if 'savings_results' not in st.session_state:
+    st.session_state.savings_results = None
+if 'earnings_results' not in st.session_state:
+    st.session_state.earnings_results = None
+if 'interval_tab2' not in st.session_state:
+    st.session_state.interval_tab2 = "Päivä"
+if 'interval_tab3' not in st.session_state:
+    st.session_state.interval_tab3 = "Päivä"
+
+def load_data(file):
     try:
-        consumption_df = pl.read_csv(consumption_file)
-        if consumption_df.shape[1] < 2:
-            st.error("CSV-tiedostossa on oltava vähintään kaksi saraketta: aikaleima ja kulutus.")
-            return None, None
-        
-        consumption_df = consumption_df.select([
-            pl.col(consumption_df.columns[0]).alias("time_stamp"),
-            pl.col(consumption_df.columns[2]).alias("consumption")
+        df = pl.read_csv(file)
+        # Validate that CSV has at least three columns
+        if len(df.columns) < 3:
+            st.error("CSV must have at least three columns in order: timestamp, spot price, consumption")
+            return None
+        # Select columns by position and rename them
+        df = df.select([
+            pl.col(df.columns[0]).alias("time_stamp"),
+            pl.col(df.columns[1]).alias("spot_price"),
+            pl.col(df.columns[2]).alias("consumption")
         ])
-        
-        price_df = pl.read_csv("electricity_prices.csv")
-        reserve_df = pl.read_csv("reserve.csv").with_columns(
-            pl.col("reserve_prices") * 0.1
+        # Convert time_stamp to datetime with explicit format, allowing nulls for unparseable values
+        df = df.with_columns(
+            pl.col('time_stamp').str.to_datetime(format="%Y-%m-%d %H:%M", strict=False).alias("time_stamp")
         )
-        
-        merged_df = consumption_df.join(price_df, on="time_stamp", how="inner").join(
-            reserve_df, on="time_stamp", how="inner"
-        )
-        
-        merged_df = merged_df.with_columns([
-            (pl.col("consumption") * pl.col("price")).alias("cost"),
-            pl.col("time_stamp").str.to_datetime().alias("time_stamp")
+        # Check for null timestamps and provide feedback
+        if df['time_stamp'].is_null().any():
+            invalid_timestamps = df.filter(pl.col('time_stamp').is_null()).select('time_stamp').to_series().to_list()
+            # Filter out rows with null timestamps
+            df = df.filter(pl.col('time_stamp').is_not_null())
+            if df.is_empty():
+                st.error("No valid timestamps remain after filtering. Please ensure timestamps are in YYYY-MM-DD HH:MM format.")
+                return None
+        # Ensure spot_price and consumption are numeric and finite
+        df = df.with_columns([
+            pl.col('spot_price').cast(pl.Float64, strict=False).fill_null(0.0),
+            pl.col('consumption').cast(pl.Float64, strict=False).fill_null(0.0)
         ])
-        
-        consumption_df = consumption_df.join(price_df, on="time_stamp", how="inner").with_columns([
-            (pl.col("price")).alias("price"),
-            pl.col("time_stamp").str.to_datetime().alias("time_stamp"),
-            pl.col("consumption").cum_sum().alias("cumulative_consumption")
-        ])
-        
-        return merged_df, consumption_df
-    except FileNotFoundError:
-        st.error("Hintatietotiedostoa 'electricity_prices.csv' tai 'reserve.csv' ei löytynyt.")
-        return None, None
+        # Check for non-finite values
+        if df['spot_price'].is_nan().any() or df['spot_price'].is_infinite().any():
+            st.error("Spot price column contains invalid (NaN or infinite) values")
+            return None
+        if df['consumption'].is_nan().any() or df['consumption'].is_infinite().any():
+            st.error("Consumption column contains invalid (NaN or infinite) values")
+            return None
+        return df
     except Exception as e:
-        st.error(f"Virhe tiedoston lukemisessa: {e}")
-        return None, None
+        st.error(f"Error loading CSV file: {e}")
+        return None
 
+def load_reserve_data(file):
+    try:
+        # Load CSV with semicolon delimiter, double-quoted values, and try parsing dates
+        df = pl.read_csv(file, separator=';', try_parse_dates=True)
+        if len(df.columns) < 3:
+            st.error("CSV must have at least three columns: startTime, endTime, reserve price")
+            return None
+        
+        # Select and rename columns
+        df = df.select([
+            pl.col('startTime').alias("time_stamp"),
+            pl.col('Taajuusohjattu käyttöreservi, tuntimarkkinahinnat').alias("reserve_price")
+        ])
+        
+        # Ensure time_stamp is datetime (Polars should parse YYYY-MM-DDTHH:MM:SS.000Z automatically)
+        try:
+            df = df.with_columns(
+                pl.col('time_stamp').cast(pl.Datetime).alias("time_stamp")
+            )
+        except Exception as e:
+            st.error(f"Error parsing timestamps (expected format: YYYY-MM-DDTHH:MM:SS.000Z): {e}")
+            return None
+        
+        # Cast reserve_price to float
+        df = df.with_columns(
+            pl.col('reserve_price').cast(pl.Float64, strict=False).fill_null(0.0)
+        )
+        
+        # Validate data
+        if df['reserve_price'].is_nan().any() or df['reserve_price'].is_infinite().any():
+            st.error("Reserve price column contains invalid (NaN or infinite) values")
+            return None
+        if df['time_stamp'].is_null().any():
+            st.error("Some timestamps could not be parsed or are missing")
+            return None
+        
+        return df
+    except Exception as e:
+        st.error(f"Error loading CSV file: {e}")
+        return None
+
+def calculate_stats(df):
+    # Average hourly consumption
+    avg_hourly = df['consumption'].mean()
+    
+    # Daily consumption
+    daily = df.group_by(df['time_stamp'].dt.date()).agg(pl.col('consumption').sum())
+    avg_daily = daily['consumption'].mean()
+    
+    # Monthly consumption
+    monthly = df.group_by(df['time_stamp'].dt.truncate('1mo')).agg(pl.col('consumption').sum())
+    avg_monthly = monthly['consumption'].mean()
+    
+    return avg_hourly, avg_daily, avg_monthly
 
 def get_plotly_config():
     """Return standardized config for Plotly charts."""
     return {
-        "scrollZoom": True,
+        "scrollZoom": True,  # Enable zooming with scroll wheel
         "displayModeBar": True,
         "modeBarButtonsToRemove": [
             "zoom2d", "pan2d", "select2d", "lasso2d",
@@ -56,622 +132,450 @@ def get_plotly_config():
         ]
     }
 
-
-def display_consumption_metrics(consumption_df, merged_df):
-    """Display key consumption metrics using Polars."""
-    avg_hourly = consumption_df["consumption"].mean()
-    avg_daily = consumption_df.group_by(pl.col("time_stamp").dt.date()).agg(
-        pl.col("consumption").sum()
-    )["consumption"].mean()
-    avg_monthly = consumption_df.group_by(pl.col("time_stamp").dt.truncate("1mo")).agg(
-        pl.col("consumption").sum()
-    )["consumption"].mean()
-    total = consumption_df["consumption"].sum()
-    
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric(label="Keskimääräinen kulutus tunnissa", value=f"{avg_hourly:.0f} kWh")
-    col2.metric(label="Keskimääräinen kulutus päivässä", value=f"{avg_daily:.0f} kWh")
-    col3.metric(label="Keskimääräinen kulutus kuukaudessa", value=f"{avg_monthly:.0f} kWh")
-    col4.metric(label="Kulutus yhteensä", value=f"{total:.0f} kWh")
-
-    avg_hourly = merged_df["price"].mean()
-    highest = merged_df["price"].max()
-
-    st.subheader("Hintatiedot")
-    col5, col6 = st.columns(2)
-    col5.metric(label="Keskim. sähkönhinta tunneittain", value=f"{avg_hourly:.2f} snt/kWh")
-    col6.metric(label="Korkein tuntihinta", value=f"{highest:.0f} snt/kWh")
-
-
-def create_consumption_chart(consumption_df):
-    """Create and display the consumption chart using Polars."""
-    aggregation_period = st.selectbox(
-        label="Valitse aikaväli kaavioon:", 
-        options=["Päivä", "Viikko", "Kuukausi"], 
-        index=0, 
-        key="consume_period"
-    )
-    is_cumulative = st.toggle(label="Kumulatiivinen", key="consume_toggle")
-    
-    chart_name = "cumulative_consumption" if is_cumulative else "consumption"
-    agg_type = pl.col(chart_name).last() if is_cumulative else pl.col(chart_name).sum()
-    
-    if aggregation_period == "Päivä":
-        chart_data = consumption_df.group_by(pl.col("time_stamp").dt.date().alias("Päivä")).agg([
-            agg_type.alias("Kulutus (kWh)"),
-            pl.col("price").mean().alias("Keskim. sähkönhinta (snt/kWh)")
-        ]).sort("Päivä")
+def prepare_graph_data(df, interval, data_column='consumption', cumulative=False):
+    if interval == "Päivä":
+        # Aggregate by day
+        chart_data = df.group_by(pl.col("time_stamp").dt.date().alias("date")).agg(
+            pl.col(data_column).sum().alias(data_column)
+        ).sort("date")
+        # Ensure all dates are present
+        min_date = chart_data['date'].min()
+        max_date = chart_data['date'].max()
+        all_dates = pl.date_range(min_date, max_date, interval="1d", eager=True)
+        chart_data = pl.DataFrame({"date": all_dates}).join(
+            chart_data, on="date", how="left"
+        ).fill_null(0)  # Fill missing data with 0
+        x_col = "date"
         time_label = "päivittäin"
-        x_col = "Päivä"
-    elif aggregation_period == "Kuukausi":
-        chart_data = consumption_df.group_by(pl.col("time_stamp").dt.truncate("1mo").alias("Kuukausi")).agg([
-            agg_type.alias("Kulutus (kWh)"),
-            pl.col("price").mean().alias("Keskim. sähkönhinta (snt/kWh)")
-        ]).with_columns(
-            pl.col("Kuukausi").dt.strftime("%Y-%m").alias("Kuukausi")
-        ).sort("Kuukausi")
-        time_label = "kuukausittain"
-        x_col = "Kuukausi"
-    else:
-        chart_data = consumption_df.group_by([
-            pl.col("time_stamp").dt.year().alias("year"),
-            pl.col("time_stamp").dt.week().alias("week")
-        ]).agg([
-            agg_type.alias("Kulutus (kWh)"),
-            pl.col("price").mean().alias("Keskim. sähkönhinta (snt/kWh)")
-        ]).with_columns(
-            (pl.col("year").cast(str) + "-W" + pl.col("week").cast(str).str.zfill(2)).alias("Viikko")
-        ).sort("Viikko")
-        time_label = "viikottain"
-        x_col = "Viikko"
-    
-    y_max = chart_data["Kulutus (kWh)"].max() * 1.1
-    
-    chart_data_pd = chart_data.select([x_col, "Kulutus (kWh)", "Keskim. sähkönhinta (snt/kWh)"]).to_pandas()
-    
-    fig = px.line(
-        chart_data_pd,
-        x=x_col,
-        y=["Kulutus (kWh)"],
-        title=f"Kulutus esitettynä {time_label}",
-        labels={
-            x_col: "Aika",
-            "value": "Kulutus (kWh)",
-            "variable": "Tyyppi"
-        }
-    )
-    fig.update_traces(mode="lines", hovertemplate="%{data.name}: %{y:.2f}<extra></extra>")
-    fig.update_layout(
-        xaxis_title="Aika",
-        yaxis_title="Kulutus (kWh)",
-        hovermode="x unified",
-        dragmode="pan",
-        height=500,
-        yaxis=dict(range=[0, y_max], fixedrange=True),
-        xaxis=dict(fixedrange=False),
-        showlegend=False
-    )
-
-    fig1 = px.line(
-        chart_data_pd,
-        x=x_col,
-        y=["Keskim. sähkönhinta (snt/kWh)"],
-        labels={
-            x_col: "Aika",
-            "value": "Kulutus (kWh)",
-            "variable": "Tyyppi"
-        }
-    )
-    fig1.update_traces(mode="lines", hovertemplate="%{data.name}: %{y:.2f}<extra></extra>")
-    fig1.update_layout(
-        xaxis_title="Aika",
-        yaxis_title="Keskim. sähkönhinta (snt/kWh)",
-        hovermode="x unified",
-        dragmode="pan",
-        height=500,
-        yaxis=dict(range=[0, chart_data_pd["Keskim. sähkönhinta (snt/kWh)"].max() * 1.1], fixedrange=True),
-        xaxis=dict(fixedrange=False),
-        showlegend=False
-    )
-    
-    config = get_plotly_config()
-    st.plotly_chart(fig, use_container_width=True, config=config, key="consume")
-    st.plotly_chart(fig1, use_container_width=True, config=config)
-
-def get_basic_battery_parameters():
-    """Get basic battery parameters from user input."""
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        max_capacity = st.number_input(
-            "Valitse akun kapasiteetti (kWh)", 
-            min_value=0, max_value=1000, value=10, key="basic_capacity_tab"
+    else:  # Kuukausi
+        # Aggregate by month
+        chart_data = df.group_by(pl.col("time_stamp").dt.truncate("1mo").alias("date")).agg(
+            pl.col(data_column).sum().alias(data_column)
+        ).sort("date")
+        # Ensure all months are present
+        min_date = chart_data['date'].min()
+        max_date = chart_data['date'].max()
+        all_dates = pl.date_range(min_date, max_date, interval="1mo", eager=True)
+        # Create a DataFrame with all months and their string representation
+        all_dates_df = pl.DataFrame({"date": all_dates}).with_columns(
+            pl.col("date").dt.strftime("%Y-%m").alias("date_str")
         )
-    with col2:
-        max_charge_rate = st.number_input(
-            "Valitse akun teho (kW)", 
-            min_value=0, value=10, key="basic_charge_rate_tab"
-        )
-    with col3:
-        battery_price = st.number_input(
-            "Valitse akun hinta (€)", 
-            min_value=0, value=10000, key="basic_price_tab"
-        )
-    return max_capacity, max_charge_rate, battery_price
-
-
-def simulate_basic_battery(merged_df, max_capacity, max_charge_rate):
-    """Simulate basic battery charging and discharging strategy using Polars."""
-    df = merged_df.clone()
-    price_limit = df["price"].mean() * 0.5
-    initial_charge = 0.0
-    
-    df = df.with_columns([
-        pl.lit(initial_charge).alias("battery_charge"),
-        (pl.col("consumption") * pl.col("price")).alias("cost")
-    ])
-    
-    def update_battery(df):
-        current_charge = initial_charge
-        charges = []
-        costs = []
-        for row in df.iter_rows(named=True):
-            if row["price"] < price_limit and current_charge < max_capacity:
-                charge_amount = min(max_charge_rate, max_capacity - current_charge)
-                current_charge += charge_amount
-                cost = row["cost"] + charge_amount * row["price"]
-            elif current_charge > 0:
-                discharge_amount = min(row["consumption"], current_charge)
-                current_charge -= discharge_amount
-                cost = row["cost"] - discharge_amount * row["price"]
-            else:
-                cost = row["cost"]
-            charges.append(current_charge)
-            costs.append(cost)
-        return df.with_columns([
-            pl.Series("battery_charge", charges),
-            pl.Series("cost", costs)
+        # Join with chart_data, using string-based join to avoid datetime issues
+        chart_data = all_dates_df.join(
+            chart_data.with_columns(pl.col("date").dt.strftime("%Y-%m").alias("date_str")),
+            on="date_str",
+            how="left"
+        ).select([
+            pl.col("date"),
+            pl.col("date_str"),
+            pl.col(data_column).fill_null(0)
         ])
-    
-    df = update_battery(df)
-    
-    df = df.with_columns(
-        (pl.col("consumption") * pl.col("price")).alias("cost_without_battery")
-    )
-    df = df.with_columns([
-        pl.col("cost_without_battery").cum_sum().alias("cumulative_cost_without_battery"),
-        pl.col("cost").cum_sum().alias("cumulative_cost_with_battery")
-    ])
-    
-    return df
-
-
-def display_basic_battery_metrics(df):
-    """Display cost metrics for basic battery simulation using Polars."""
-    total_without_battery = df["cost_without_battery"].sum() * 0.01
-    total_with_battery = df["cost"].sum() * 0.01
-    total_savings = total_without_battery - total_with_battery
-    
-    time_span_days = (df["time_stamp"].max() - df["time_stamp"].min()).days + 1
-    time_span_months = time_span_days / 30.44
-    time_span_years = time_span_days / 365.25
-    
-    avg_savings_per_day = total_savings / time_span_days if time_span_days > 0 else 0
-    avg_savings_per_month = total_savings / time_span_months if time_span_months > 0 else 0
-    avg_savings_per_year = total_savings / time_span_years if time_span_years > 0 else 0
-    
-    col1, col2, col3 = st.columns(3)
-    col1.metric(label="Kulut ilman akkua", value=f"{total_without_battery:.2f}€")
-    col2.metric(label="Kulut akulla", value=f"{total_with_battery:.2f}€")
-    col3.metric(label="Säästöt akusta", value=f"{total_savings:.2f}€")
-    
-    col4, col5, col6 = st.columns(3)
-    col4.metric(label="Keskim. säästöt päivässä", value=f"{avg_savings_per_day:.2f}€")
-    col5.metric(label="Keskim. säästöt kuukaudessa", value=f"{avg_savings_per_month:.2f}€")
-    col6.metric(label="Keskim. säästöt vuodessa", value=f"{avg_savings_per_year:.2f}€")
-
-
-def create_basic_battery_chart(df, battery_price):
-    """Create and display the cost comparison chart for basic battery using Polars."""
-    aggregation_period = st.selectbox(
-        "Valitse aikaväli kaavioon:", 
-        ["Päivä", "Viikko", "Kuukausi"], 
-        index=0, key="basic_period_tab"
-    )
-    is_cumulative = st.toggle("Kumulatiivinen", key="basic_toggle_tab")
-    show_price_line = st.toggle("Näytä akun hinta viivana", key="basic_price_line_toggle")
-    
-    no_battery_column = "cumulative_cost_without_battery" if is_cumulative else "cost_without_battery"
-    with_battery_column = "cumulative_cost_with_battery" if is_cumulative else "cost"
-    agg_type = pl.last if is_cumulative else pl.sum
-    
-    if aggregation_period == "Päivä":
-        chart_data = df.group_by(pl.col("time_stamp").dt.date().alias("Päivä")).agg([
-            agg_type(no_battery_column).alias("Hinta ilman akkua"),
-            agg_type(with_battery_column).alias("Hinta akulla")
-        ]).sort("Päivä")
-        time_label = "päivittäin"
-        x_col = "Päivä"
-    elif aggregation_period == "Kuukausi":
-        chart_data = df.group_by(pl.col("time_stamp").dt.truncate("1mo").alias("Kuukausi")).agg([
-            agg_type(no_battery_column).alias("Hinta ilman akkua"),
-            agg_type(with_battery_column).alias("Hinta akulla")
-        ]).with_columns(
-            pl.col("Kuukausi").dt.strftime("%Y-%m").alias("Kuukausi")
-        ).sort("Kuukausi")
+        x_col = "date_str"
         time_label = "kuukausittain"
-        x_col = "Kuukausi"
-    else:
-        chart_data = df.group_by([
-            pl.col("time_stamp").dt.year().alias("year"),
-            pl.col("time_stamp").dt.week().alias("week")
-        ]).agg([
-            agg_type(no_battery_column).alias("Hinta ilman akkua"),
-            agg_type(with_battery_column).alias("Hinta akulla")
-        ]).with_columns(
-            (pl.col("year").cast(str) + "-W" + pl.col("week").cast(str).str.zfill(2)).alias("Viikko")
-        ).sort("Viikko")
-        time_label = "viikottain"
-        x_col = "Viikko"
     
-    chart_data = chart_data.with_columns(pl.col("*").exclude(x_col) * 0.01)
-    y_max = max(chart_data.select([pl.col("Hinta ilman akkua"), pl.col("Hinta akulla")]).max().to_numpy().max() * 1.1, battery_price * 1.1) if show_price_line else chart_data.select([pl.col("Hinta ilman akkua"), pl.col("Hinta akulla")]).max().to_numpy().max() * 1.1
-    y_min = chart_data.select([pl.col("Hinta ilman akkua"), pl.col("Hinta akulla")]).min().to_numpy().min() * 1.1 if chart_data.select([pl.col("Hinta ilman akkua"), pl.col("Hinta akulla")]).min().to_numpy().min() < 0 else 0
-    
-    chart_data_pd = chart_data.select([x_col, "Hinta ilman akkua", "Hinta akulla"]).to_pandas()
-    
-    fig = px.line(
-        chart_data_pd,
-        x=x_col,
-        y=["Hinta ilman akkua", "Hinta akulla"],
-        title=f"Kustannukset esitettynä {time_label}",
-        labels={
-            x_col: "Aika",
-            "value": "Hinta (€)",
-            "variable": "Tyyppi"
-        }
-    )
-    fig.update_traces(mode="lines", hovertemplate="%{data.name}: %{y:.2f}€<extra></extra>")
-    
-    if show_price_line:
-        fig.add_hline(
-            y=battery_price,
-            line_dash="dash",
-            line_color="orange",
-            annotation_text="Akun hinta",
-            annotation_position="top left"
+    # Apply cumulative sum if requested
+    if cumulative:
+        chart_data = chart_data.with_columns(
+            pl.col(data_column).cum_sum().alias(data_column)
         )
     
-    fig.update_layout(
-        xaxis_title="Aika",
-        yaxis_title="Hinta (€)",
-        legend_title="Tyyppi",
-        hovermode="x unified",
-        dragmode="pan",
-        height=500,
-        yaxis=dict(range=[y_min, y_max], fixedrange=True),
-        xaxis=dict(fixedrange=False)
+    return chart_data, x_col, time_label
+
+def optimize_battery_savings(df, capacity, power):
+    # Validate input data
+    if df.is_empty():
+        st.error("Input data is empty")
+        return None, None
+    
+    # Convert Polars DataFrame to lists for PuLP
+    prices = df['spot_price'].to_list()  # in snt/kWh (cents per kWh)
+    consumption = df['consumption'].to_list()  # in kWh
+    n = len(df)
+    
+    # Check for non-finite values in prices and consumption
+    if any(not np.isfinite(p) for p in prices):
+        st.error("Spot prices contain invalid values")
+        return None, None
+    if any(not np.isfinite(c) for c in consumption):
+        st.error("Consumption values contain invalid values")
+        return None, None
+    
+    # Create the LP problem
+    model = LpProblem("Battery_Optimization", LpMinimize)
+    
+    # Variables
+    # Battery state of charge at each time step (kWh)
+    soc = [LpVariable(f"soc_{i}", 0, capacity) for i in range(n)]
+    # Energy charged to battery (kWh)
+    charge = [LpVariable(f"charge_{i}", 0, power) for i in range(n)]
+    # Energy discharged from battery (kWh)
+    discharge = [LpVariable(f"discharge_{i}", 0, power) for i in range(n)]
+    
+    # Objective: Minimize total cost
+    # Cost = (consumption - discharge + charge) * price (in cents)
+    model += lpSum([(consumption[i] - discharge[i] + charge[i]) * prices[i] for i in range(n)])
+    
+    # Constraints
+    for i in range(n):
+        if i == 0:
+            # Initial state of charge
+            model += soc[0] == charge[0] - discharge[0]
+        else:
+            # State of charge update
+            model += soc[i] == soc[i-1] + charge[i] - discharge[i]
+    
+    # Solve the problem
+    solver = PULP_CBC_CMD(msg=False)
+    model.solve(solver)
+    
+    # Check if solution was found
+    if model.status != 1:
+        st.error("Optimization failed to find a solution")
+        return None, None
+    
+    # Extract results
+    net_consumption = []
+    for i in range(n):
+        net = consumption[i] - discharge[i].varValue + charge[i].varValue
+        net_consumption.append(net)
+    
+    # Calculate costs (in cents)
+    cost_with_battery = sum(net * price for net, price in zip(net_consumption, prices))
+    cost_without_battery = sum(c * price for c, price in zip(consumption, prices))
+    savings = cost_without_battery - cost_with_battery  # in cents
+    
+    # Convert total savings to euros for display
+    savings_eur = savings / 100.0
+    
+    # Add savings to DataFrame (savings in euros per hour)
+    df_with_savings = df.with_columns(
+        pl.Series("net_consumption", net_consumption),
+        pl.Series("savings", [((c - nc) * p) / 100.0 for c, nc, p in zip(consumption, net_consumption, prices)])
     )
     
-    config = get_plotly_config()
-    st.plotly_chart(fig, use_container_width=True, config=config)
+    return savings_eur, df_with_savings
 
+def calculate_periodic_metrics(df, total_amount):
+    # Calculate the total duration of the data in hours
+    time_diff = df['time_stamp'].max() - df['time_stamp'].min()
+    total_hours = time_diff.total_seconds() / 3600 if time_diff is not None else len(df)
+    
+    # Handle case where data is less than an hour
+    if total_hours < 1:
+        total_hours = len(df)  # Assume each row is one hour if time stamps are missing or too close
+    
+    # Calculate amount rate (euros per hour)
+    amount_per_hour = total_amount / total_hours if total_hours > 0 else 0
+    
+    # Scale to different time periods
+    # Daily: amount_per_hour * 24 hours
+    avg_daily = amount_per_hour * 24
+    
+    # Monthly: amount_per_hour * 24 hours * 30.42 days (average days per month)
+    avg_monthly = amount_per_hour * 24 * 30.42
+    
+    # Yearly: amount_per_hour * 24 hours * 365 days
+    avg_yearly = amount_per_hour * 24 * 365
+    
+    return avg_daily, avg_monthly, avg_yearly
 
-def get_reserve_battery_parameters(max_capacity):
-    """Get reserve capacity for reserve simulation."""
-    reserve_capacity = st.number_input(
-        "Valitse reservikapasiteetti (kW)", 
-        min_value=0, max_value=max_capacity, value=max_capacity, key="reserve_amount_tab"
-    )
-    return reserve_capacity
-
-
-def simulate_reserve_battery(merged_df, max_capacity, max_charge_rate, reserve_capacity):
-    """Simulate battery operation with reserve capacity using Polars."""
-    df = merged_df.clone()
-    price_limit = df["price"].mean() * 0.5
-    initial_charge = 0.0
+def calculate_reserve_earnings(df, power):
+    # Convert power from kW to MW
+    power_mw = power / 1000.0
     
-    df = df.with_columns([
-        pl.lit(initial_charge).alias("battery_charge_reserve"),
-        (pl.col("consumption") * pl.col("price")).alias("cost_for_reserve")
-    ])
-    
-    def update_reserve_battery(df):
-        current_charge = initial_charge
-        charges = []
-        costs = []
-        for row in df.iter_rows(named=True):
-            if row["price"] < price_limit and current_charge < max_capacity:
-                charge_amount = min(max_charge_rate - reserve_capacity, max_capacity - current_charge)
-                current_charge += charge_amount
-                cost = row["cost_for_reserve"] + charge_amount * row["price"]
-            elif current_charge > 0:
-                discharge_amount = min(row["consumption"], current_charge)
-                current_charge -= discharge_amount
-                cost = row["cost_for_reserve"] - discharge_amount * row["price"]
-            else:
-                cost = row["cost_for_reserve"]
-            
-            cost -= reserve_capacity * row["reserve_prices"]
-            
-            charges.append(current_charge)
-            costs.append(cost)
-        return df.with_columns([
-            pl.Series("battery_charge_reserve", charges),
-            pl.Series("cost_for_reserve", costs)
-        ])
-    
-    df = update_reserve_battery(df)
-    
+    # Calculate earnings per hour: power (MW) * reserve price (€/MW per hour)
     df = df.with_columns(
-        (pl.col("consumption") * pl.col("price")).alias("cost_without_battery")
-    )
-    df = df.with_columns([
-        pl.col("cost_without_battery").cum_sum().alias("cumulative_cost_without_battery"),
-        pl.col("cost_for_reserve").cum_sum().alias("cumulative_cost_with_battery_reserve")
-    ])
-    
-    return df
-
-
-def display_reserve_battery_metrics(df):
-    """Display cost metrics for reserve battery simulation using Polars."""
-    total_without_battery = df["cost_without_battery"].sum() * 0.01
-    total_with_reserve = df["cost_for_reserve"].sum() * 0.01
-    total_earnings = total_without_battery - total_with_reserve
-    
-    time_span_days = (df["time_stamp"].max() - df["time_stamp"].min()).days + 1
-    time_span_months = time_span_days / 30.44
-    time_span_years = time_span_days / 365.25
-    
-    avg_earnings_per_day = total_earnings / time_span_days if time_span_days > 0 else 0
-    avg_earnings_per_month = total_earnings / time_span_months if time_span_months > 0 else 0
-    avg_earnings_per_year = total_earnings / time_span_years if time_span_years > 0 else 0
-    
-    col1, col2, col3 = st.columns(3)
-    col1.metric(label="Keskim. tuotto päivässä", value=f"{avg_earnings_per_day:.2f}€")
-    col2.metric(label="Keskim. tuotto kuukaudessa", value=f"{avg_earnings_per_month:.2f}€")
-    col3.metric(label="Keskim. tuotto vuodessa", value=f"{avg_earnings_per_year:.2f}€")
-    st.metric(label="Kokonaisetu reservistä", value=f"{total_earnings:.2f}€")
-
-def create_reserve_prices_chart(df):
-    """Create and display the reservemarket prices using Polars"""
-    aggregation_period = st.selectbox(
-        "Valitse aikaväli kaavioon:",
-        ["Päivä", "Viikko", "Kuukausi"],
-        index=0, key="reserve_prices_period"
-    )
-    if aggregation_period == "Päivä":
-        chart_data = df.group_by(pl.col("time_stamp").dt.date().alias("Päivä")).agg([
-            pl.sum("reserve_prices").alias("FCR-N hinta")
-        ]).sort("Päivä")
-        time_label = "päivittäin"
-        x_col = "Päivä"
-    elif aggregation_period == "Kuukausi":
-        chart_data = df.group_by(pl.col("time_stamp").dt.truncate("1mo").alias("Kuukausi")).agg([
-            pl.sum("reserve_prices").alias("FCR-N hinta")
-        ]).with_columns(
-            pl.col("Kuukausi").dt.strftime("%Y-%m").alias("Kuukausi")
-        ).sort("Kuukausi")
-        time_label = "kuukausittain"
-        x_col = "Kuukausi"
-    else:
-        chart_data = df.group_by([
-            pl.col("time_stamp").dt.year().alias("year"),
-            pl.col("time_stamp").dt.year().alias("week")
-        ]).agg([
-            pl.sum("reserve_price").alias("FCR-N hinta")
-        ]).with_columns(
-            (pl.col("year").cast(str) + "-W" + pl.col("week").cast(str).str.zfill(2)).alias("Viikko")
-        ).sort("Viikko")
-        time_label = "viikottain"
-        x_col = "Viikko"
-    
-    y_max = chart_data.select([pl.col("FCR-N hinta")]).max().to_numpy().max() * 1.1
-    y_min = 0.0
-    chart_data_pd = chart_data.select([x_col, "FCR-N hinta"]).to_pandas()
-    
-    fig = px.line(
-        chart_data_pd,
-        x=x_col,
-        y=["FCR-N hinta"],
-        title=f"Hinnat esitettynä {time_label}",
-        labels={
-            x_col: "Aika",
-            "value": "Hinta (EUR/MW)",
-            "variable": "Tyyppi"
-        }
-    )
-    fig.update_traces(mode="lines", hovertemplate="%{data.name}: %{y:.2f}€<extra></extra>")
-    fig.update_layout(
-        xaxis_title="Aika",
-        yaxis_title="Hinta (EUR/MW)",
-        legend_title="Tyyppi",
-        hovermode="x unified",
-        dragmode="pan",
-        height=500,
-        yaxis=dict(range=[y_min, y_max], fixedrange=True),
-        xaxis=dict(fixedrange=False)
+        pl.col('reserve_price').mul(power_mw).alias('earnings')
     )
     
-    config = get_plotly_config()
-    st.plotly_chart(fig, use_container_width=True, config=config)
+    # Total earnings over the data period
+    total_earnings = df['earnings'].sum()
+    
+    return total_earnings, df
 
-def create_reserve_battery_chart(df, basic_battery_df, battery_price):
-    """Create and display the cost comparison chart for reserve battery using Polars."""
-    aggregation_period = st.selectbox(
-        "Valitse aikaväli kaavioon:", 
-        ["Päivä", "Viikko", "Kuukausi"], 
-        index=0, key="reserve_period_tab"
-    )
-    is_cumulative = st.toggle("Kumulatiivinen", key="reserve_toggle_tab")
-    show_price_line = st.toggle("Näytä akun hinta viivana", key="reserve_price_line_toggle")
-    
-    no_battery_column = "cumulative_cost_without_battery" if is_cumulative else "cost_without_battery"
-    with_battery_column = "cumulative_cost_with_battery" if is_cumulative else "cost"
-    reserve_column = "cumulative_cost_with_battery_reserve" if is_cumulative else "cost_for_reserve"
-    agg_type = pl.last if is_cumulative else pl.sum
-    
-    if aggregation_period == "Päivä":
-        reserve_data = df.group_by(pl.col("time_stamp").dt.date().alias("Päivä")).agg([
-            agg_type(reserve_column).alias("Reservimarkkinoiden tuotto"),
-            agg_type(no_battery_column).alias("Hinta ilman akkua")
-        ]).sort("Päivä")
-        battery_data = basic_battery_df.group_by(pl.col("time_stamp").dt.date().alias("Päivä")).agg(
-            agg_type(with_battery_column).alias("Hinta akulla")
-        ).sort("Päivä")
-        chart_data = reserve_data.join(battery_data, on="Päivä", how="full")
-        time_label = "päivittäin"
-        x_col = "Päivä"
-    elif aggregation_period == "Kuukausi":
-        reserve_data = df.group_by(pl.col("time_stamp").dt.truncate("1mo").alias("Kuukausi")).agg([
-            agg_type(reserve_column).alias("Reservimarkkinoiden tuotto"),
-            agg_type(no_battery_column).alias("Hinta ilman akkua")
-        ]).with_columns(
-            pl.col("Kuukausi").dt.strftime("%Y-%m").alias("Kuukausi")
-        ).sort("Kuukausi")
-        battery_data = basic_battery_df.group_by(pl.col("time_stamp").dt.truncate("1mo").alias("Kuukausi")).agg(
-            agg_type(with_battery_column).alias("Hinta akulla")
-        ).with_columns(
-            pl.col("Kuukausi").dt.strftime("%Y-%m").alias("Kuukausi")
-        ).sort("Kuukausi")
-        chart_data = reserve_data.join(battery_data, on="Kuukausi", how="full")
-        time_label = "kuukausittain"
-        x_col = "Kuukausi"
-    else:
-        reserve_data = df.group_by([
-            pl.col("time_stamp").dt.year().alias("year"),
-            pl.col("time_stamp").dt.week().alias("week")
-        ]).agg([
-            agg_type(reserve_column).alias("Reservimarkkinoiden tuotto"),
-            agg_type(no_battery_column).alias("Hinta ilman akkua")
-        ]).with_columns(
-            (pl.col("year").cast(str) + "-W" + pl.col("week").cast(str).str.zfill(2)).alias("Viikko")
-        ).sort("Viikko")
-        battery_data = basic_battery_df.group_by([
-            pl.col("time_stamp").dt.year().alias("year"),
-            pl.col("time_stamp").dt.week().alias("week")
-        ]).agg(
-            agg_type(with_battery_column).alias("Hinta akulla")
-        ).with_columns(
-            (pl.col("year").cast(str) + "-W" + pl.col("week").cast(str).str.zfill(2)).alias("Viikko")
-        ).sort("Viikko")
-        chart_data = reserve_data.join(battery_data, on="Viikko", how="full")
-        time_label = "viikottain"
-        x_col = "Viikko"
-    
-    chart_data = chart_data.with_columns([
-        ((pl.col("Hinta ilman akkua") - pl.col("Reservimarkkinoiden tuotto")) * 0.01).alias("Reservimarkkinoiden tuotto"),
-        (pl.col("Hinta ilman akkua") * 0.01).alias("Hinta ilman akkua"),
-        (pl.col("Hinta akulla") * 0.01).alias("Hinta akulla")
-    ])
-    
-    y_max = max(chart_data.select([pl.col("Hinta ilman akkua"), pl.col("Hinta akulla"), pl.col("Reservimarkkinoiden tuotto")]).max().to_numpy().max() * 1.1, battery_price * 1.1) if show_price_line else chart_data.select([pl.col("Hinta ilman akkua"), pl.col("Hinta akulla"), pl.col("Reservimarkkinoiden tuotto")]).max().to_numpy().max() * 1.1
-    y_min = chart_data.select([pl.col("Hinta ilman akkua"), pl.col("Hinta akulla"), pl.col("Reservimarkkinoiden tuotto")]).min().to_numpy().min() * 1.1 if chart_data.select([pl.col("Hinta ilman akkua"), pl.col("Hinta akulla"), pl.col("Reservimarkkinoiden tuotto")]).min().to_numpy().min() < 0 else 0
-    
-    chart_data_pd = chart_data.select([x_col, "Hinta ilman akkua", "Hinta akulla", "Reservimarkkinoiden tuotto"]).to_pandas()
-    
-    fig = px.line(
-        chart_data_pd,
-        x=x_col,
-        y=["Hinta ilman akkua", "Hinta akulla", "Reservimarkkinoiden tuotto"],
-        title=f"Kustannusvertailu esitettynä {time_label}",
-        labels={
-            x_col: "Aika",
-            "value": "Hinta (€)",
-            "variable": "Tyyppi"
-        }
-    )
-    fig.update_traces(mode="lines", hovertemplate="%{data.name}: %{y:.2f}€<extra></extra>")
-    fig.data[0].line.color = "red"
-    fig.data[1].line.color = "blue"
-    fig.data[2].line.color = "green"
-    
-    if show_price_line:
-        fig.add_hline(
-            y=battery_price,
-            line_dash="dash",
-            line_color="orange",
-            annotation_text="Akun hinta",
-            annotation_position="top left"
-        )
-    
-    fig.update_layout(
-        xaxis_title="Aika",
-        yaxis_title="Hinta (€)",
-        legend_title="Tyyppi",
-        hovermode="x unified",
-        dragmode="pan",
-        height=500,
-        yaxis=dict(range=[y_min, y_max], fixedrange=True),
-        xaxis=dict(fixedrange=False)
-    )
-    
-    config = get_plotly_config()
+# Create tabs
+tab1, tab2, tab3 = st.tabs(["Kulutustiedot", "Akun vaikutus", "Reservimarkkinat"])
 
-    fig1 = px.bar(
-        chart_data_pd,
-        x=x_col,
-        y=["Hinta ilman akkua", "Hinta akulla", "Reservimarkkinoiden tuotto"],
-        barmode="group")
+with tab1:
+    st.header("Kulutustiedot")
     
-    fig1.update_traces(hovertemplate="%{data.name}: %{y:.2f}€<extra></extra>")
-
-    fig1.update_layout(
-        xaxis_title="Aika",
-        yaxis_title="Hinta (€)",
-        legend_title="Tyyppi",
-        hovermode="x unified",
-        dragmode="pan",
-        yaxis=dict(range=[y_min, y_max], fixedrange=True),
-        xaxis=dict(fixedrange=False)
-    )
-    col1, col2 = st.columns(2)
-    with col1:
-        st.plotly_chart(fig, use_container_width=True, config=config)
-    with col2:
-        st.plotly_chart(fig1, use_container_width=True, config=config)
-
-
-def main():
-    """Main application function with tabs."""
-    st.set_page_config(layout="wide")
-    st.header("Lähetä CSV-tiedosto kulutuksestasi")
-    st.subheader("Tarkista, että tiedostossa on aikaleima ensimmäisessä sarakkeessa ja kulutus toisessa sarakkeessa.")
-    consumption_file = st.file_uploader("Valitse CSV-tiedosto", type="csv")
+    # File uploader
+    uploaded_file = st.file_uploader("Lähetä CSV-tiedosto kulutustiedoista", type=["csv"], key="tab1_uploader")
+    st.markdown("Varmista, että CSV-tiedostossa on sarakkeet: aika, spot-hinta ja kulutus erotettuina pilkuilla. VÄE:n antamat datat toimivat hyvin.")
     
-    if consumption_file is not None:
-        merged_df, consumption_df = load_data(consumption_file)
+    if uploaded_file is not None:
+        st.session_state.uploaded_file_tab1 = uploaded_file
+        df = load_data(uploaded_file)
         
-        if merged_df is not None and consumption_df is not None:
-            tab1, tab2, tab3 = st.tabs(["Kulutustiedot", "Akun vaikutus", "Reservimarkkinat"])
+        if df is not None:
+            # Calculate statistics
+            avg_hourly, avg_daily, avg_monthly = calculate_stats(df)
             
-            with tab1:
-                st.header("Kulutustiedot")
-                display_consumption_metrics(consumption_df, merged_df)
-                create_consumption_chart(consumption_df)
+            # Display statistics in columns
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Keskim. kulutus tunnissa", f"{avg_hourly:.2f} kWh")
+            with col2:
+                st.metric("Keskim. kulutus päivässä", f"{avg_daily:.2f} kWh")
+            with col3:
+                st.metric("Keskim. kulutus kuukaudessa", f"{avg_monthly:.2f} kWh")
             
-            with tab2:
-                st.header("Akun vaikutus kustannuksiin")
-                st.subheader("Akun ominaisuudet")
-                max_capacity, max_charge_rate, battery_price = get_basic_battery_parameters()
-                basic_battery_df = simulate_basic_battery(merged_df, max_capacity, max_charge_rate)
-                display_basic_battery_metrics(basic_battery_df)
-                create_basic_battery_chart(basic_battery_df, battery_price)
+            # Dropdown for time interval
+            st.subheader("Kulutus aikajaksolla")
+            interval = st.selectbox("Valitse aikaväli kaavioon", ["Päivä", "Kuukausi"], index=0, key="tab1_interval")
             
-            with tab3:
-                st.header("Reservimarkkinat")
-                st.subheader("Reservikapasiteetti")
-                reserve_capacity = get_reserve_battery_parameters(max_capacity)
-                reserve_battery_df = simulate_reserve_battery(merged_df, max_capacity, max_charge_rate, reserve_capacity)
-                display_reserve_battery_metrics(reserve_battery_df)
-                create_reserve_battery_chart(reserve_battery_df, basic_battery_df, battery_price)
-                check = st.expander(label="Tarkista simulaation laskelmat taulukosta", expanded=False)
-                with check:
-                    st.dataframe(reserve_battery_df)
-                st.subheader("Reservimarkkinan tuntihinnat")
-                create_reserve_prices_chart(merged_df)
+            # Prepare and display Plotly graph
+            chart_data, x_col, time_label = prepare_graph_data(df, interval, data_column='consumption')
+            chart_data_pd = chart_data.select([x_col, "consumption"]).to_pandas()
+            y_max = chart_data["consumption"].max() * 1.1 if chart_data["consumption"].max() > 0 else 1.0
+            
+            fig = px.line(
+                chart_data_pd,
+                x=x_col,
+                y=["consumption"],
+                title=f"Kulutus {time_label}",
+                labels={
+                    x_col: "Aika",
+                    "value": "Kulutus (kWh)",
+                    "variable": "Type"
+                }
+            )
+            fig.update_traces(mode="lines", hovertemplate="Kulutus: %{y:.2f} kWh<extra></extra>")
+            fig.update_layout(
+                xaxis_title="Aika",
+                yaxis_title="Kulutus (kWh)",
+                hovermode="x unified",
+                dragmode="pan",
+                height=500,
+                yaxis=dict(range=[0, y_max], fixedrange=True),
+                xaxis=dict(fixedrange=False),
+                showlegend=False
+            )
+            
+            config = get_plotly_config()
+            st.plotly_chart(fig, use_container_width=True, config=config)
+    else:
+        st.info("Lähetä CSV-tiedosto tarkastellaksesi kulutustietoja.")
 
+with tab2:
+    st.header("Akun vaikutus kustannuksiin")
+    
+    # File uploader
+    uploaded_file = st.file_uploader("Lähetä CSV-tiedosto kulutustiedoista", type=["csv"], key="tab2_uploader")
+    st.markdown("Varmista, että CSV-tiedostossa on sarakkeet: aika, spot-hinta ja kulutus erotettuina pilkuilla. VÄE:n antamat datat toimivat hyvin.")
+    
+    if uploaded_file is not None:
+        st.session_state.uploaded_file_tab2 = uploaded_file
+        df = load_data(uploaded_file)
+        
+        if df is not None:
+            # Battery parameters input
+            st.subheader("Akun ominaisuudet")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                capacity = st.number_input("Valitse akun kapasiteetti (kWh)", min_value=0.0, value=10.0, step=1.0)
+            with col2:
+                power = st.number_input("Valitse akun teho (kW)", min_value=0.0, value=5.0, step=1.0)
+            with col3:
+                price = st.number_input("Valitse akun hinta (€)", min_value=0.0, value=10000.0, step=100.0)
+            
+            if st.button("Laske säästöt"):
+                # Optimize battery savings
+                total_savings, df_with_savings = optimize_battery_savings(df, capacity, power)
+                # Store results in session state
+                st.session_state.savings_results = {
+                    'total_savings': total_savings,
+                    'df_with_savings': df_with_savings
+                }
+            
+            # Display results if available
+            if st.session_state.savings_results is not None:
+                total_savings = st.session_state.savings_results['total_savings']
+                df_with_savings = st.session_state.savings_results['df_with_savings']
+                
+                if total_savings is not None and df_with_savings is not None:
+                    # Calculate savings statistics
+                    avg_daily_savings, avg_monthly_savings, avg_yearly_savings = calculate_periodic_metrics(df_with_savings, total_savings)
+                    
+                    # Calculate payback period
+                    payback_period = price / avg_yearly_savings if avg_yearly_savings > 0 else float('inf')
+                    
+                    # Display statistics in columns
+                    st.subheader("Säästöt")
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Keskim. säästöt päivässä", f"{avg_daily_savings:.2f} €")
+                    with col2:
+                        st.metric("Keskim. säästöt kuukaudessa", f"{avg_monthly_savings:.2f} €")
+                    with col3:
+                        st.metric("Keskim. säästöt vuodessa", f"{avg_yearly_savings:.2f} €")
+                    with col4:
+                        st.metric("Kokonaissäästöt", f"{total_savings:.2f} €")
+                    
+                    # Display payback period with subheader
+                    st.subheader("Takaisinmaksuaika")
+                    if payback_period != float('inf'):
+                        st.markdown(f"Takaisinmaksu aika akullesi kulutusoptimoinnilla on **{payback_period:.2f} vuotta**.")
+                    else:
+                        st.markdown("Takaisinmaksu aika akullesi kulutusoptimoinnilla on **N/A** (ei säästöja).")
+                    
+                    # Dropdown for time interval
+                    st.subheader("Säästöt aikajaksolla")
+                    interval = st.selectbox(
+                        "Valitse aikaväli kaavioon",
+                        ["Päivä", "Kuukausi"],
+                        index=0 if st.session_state.interval_tab2 == "Päivä" else 1,
+                        key="tab2_interval"
+                    )
+                    st.session_state.interval_tab2 = interval
+                    
+                    # Checkbox for cumulative graph
+                    cumulative = st.checkbox("Näytä kumulatiiviset säästöt", key="tab2_cumulative")
+                    
+                    # Prepare and display Plotly graph
+                    chart_data, x_col, time_label = prepare_graph_data(
+                        df_with_savings, interval, data_column='savings', cumulative=cumulative
+                    )
+                    chart_data_pd = chart_data.select([x_col, "savings"]).to_pandas()
+                    y_max = chart_data["savings"].max() * 1.1 if chart_data["savings"].max() > 0 else 1.0
+                    
+                    title = f"Kumulatiiviset Säästöt {time_label}" if cumulative else f"Säästöt {time_label}"
+                    y_label = "Kumulatiiviset Säästöt (€)" if cumulative else "Säästöt (€)"
+                    hover_template = "Kumulatiiviset Säästöt: %{y:.2f} €<extra></extra>" if cumulative else "Säästöt: %{y:.2f} €<extra></extra>"
+                    
+                    fig = px.line(
+                        chart_data_pd,
+                        x=x_col,
+                        y=["savings"],
+                        title=title,
+                        labels={
+                            x_col: "Aika",
+                            "value": y_label,
+                            "variable": "Type"
+                        }
+                    )
+                    fig.update_traces(mode="lines", hovertemplate=hover_template)
+                    fig.update_layout(
+                        xaxis_title="Aika",
+                        yaxis_title=y_label,
+                        hovermode="x unified",
+                        dragmode="pan",
+                        height=500,
+                        yaxis=dict(range=[0, y_max], fixedrange=True),
+                        xaxis=dict(fixedrange=False),
+                        showlegend=False
+                    )
+                    
+                    config = get_plotly_config()
+                    st.plotly_chart(fig, use_container_width=True, config=config)
+    else:
+        st.info("Lähetä CSV-tiedosto tarkastellaksesi säästötietoja.")
 
-if __name__ == "__main__":
-    main()
+with tab3:
+    st.header("Reservituottolaskuri")
+    
+    # File uploader
+    uploaded_file = st.file_uploader("Lähetä CSV-tiedosto reservihinnoista (€/MW)", type=["csv"], key="tab3_uploader")
+    st.markdown("Varmista, että CSV-tiedosto on samassa muodossa kuin Fingridin avoimen datan sivuston tiedostot. CSV-tiedosto kannattaa olla ladattu juuri Fingridin sivustolta.")
+    if uploaded_file is not None:
+        st.session_state.uploaded_file_tab3 = uploaded_file
+        df = load_reserve_data(uploaded_file)
+        
+        if df is not None:
+            # Battery parameters input
+            st.subheader("Akun ominaisuudet")
+            col1, col2 = st.columns(2)
+            with col1:
+                power = st.number_input("Valitse akun teho (kW)", min_value=0.0, value=5.0, step=1.0, key="tab3_power")
+            with col2:
+                price = st.number_input("Valitse akun hinta (€)", min_value=0.0, value=10000.0, step=100.0, key="tab3_price")
+            
+            if st.button("Laske reservituotot", key="tab3_calculate"):
+                # Calculate reserve earnings
+                total_earnings, df_with_earnings = calculate_reserve_earnings(df, power)
+                # Store results in session state
+                st.session_state.earnings_results = {
+                    'total_earnings': total_earnings,
+                    'df_with_earnings': df_with_earnings
+                }
+            
+            # Display results if available
+            if st.session_state.earnings_results is not None:
+                total_earnings = st.session_state.earnings_results['total_earnings']
+                df_with_earnings = st.session_state.earnings_results['df_with_earnings']
+                
+                if total_earnings is not None and df_with_earnings is not None:
+                    # Calculate earnings statistics
+                    avg_daily_earnings, avg_monthly_earnings, avg_yearly_earnings = calculate_periodic_metrics(df_with_earnings, total_earnings)
+                    
+                    # Calculate payback period
+                    payback_period = price / avg_yearly_earnings if avg_yearly_earnings > 0 else float('inf')
+                    
+                    # Display statistics in columns
+                    st.subheader("Tuottotilastot")
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Keskim. reservituotot päivässä", f"{avg_daily_earnings:.2f} €")
+                    with col2:
+                        st.metric("Keskim. reservituotot kuukaudessa", f"{avg_monthly_earnings:.2f} €")
+                    with col3:
+                        st.metric("Keskim. reservituotot vuodessa", f"{avg_yearly_earnings:.2f} €")
+                    
+                    # Display payback period with subheader
+                    st.subheader("Takaisinmaksuaika")
+                    if payback_period != float('inf'):
+                        st.markdown(f"Takaisinmaksuaika akullesi reservimarkkinoilla on **{payback_period:.2f} vuotta**.")
+                    else:
+                        st.markdown("Takaisinmaksuaika akullesi reservimarkkinoilla on **N/A** (ei tuottoja).")
+                    
+                    # Dropdown for time interval
+                    st.subheader("Tuotot aikajaksolla")
+                    interval = st.selectbox(
+                        "Valitse aikaväli kaavioon",
+                        ["Päivä", "Kuukausi"],
+                        index=0 if st.session_state.interval_tab3 == "Päivä" else 1,
+                        key="tab3_interval"
+                    )
+                    st.session_state.interval_tab3 = interval
+                    
+                    # Checkbox for cumulative graph
+                    cumulative = st.checkbox("Näytä kumulatiiviset tuotot", key="tab3_cumulative")
+                    
+                    # Prepare and display Plotly graph
+                    chart_data, x_col, time_label = prepare_graph_data(
+                        df_with_earnings, interval, data_column='earnings', cumulative=cumulative
+                    )
+                    chart_data_pd = chart_data.select([x_col, "earnings"]).to_pandas()
+                    y_max = chart_data["earnings"].max() * 1.1 if chart_data["earnings"].max() > 0 else 1.0
+                    
+                    title = f"Kumulatiiviset Tuotot {time_label}" if cumulative else f"Tuotot {time_label}"
+                    y_label = "Kumulatiiviset Tuotot (€)" if cumulative else "Tuotot (€)"
+                    hover_template = "Kumulatiiviset Tuotot: %{y:.2f} €<extra></extra>" if cumulative else "Tuotot: %{y:.2f} €<extra></extra>"
+                    
+                    fig = px.line(
+                        chart_data_pd,
+                        x=x_col,
+                        y=["earnings"],
+                        title=title,
+                        labels={
+                            x_col: "Aika",
+                            "value": y_label,
+                            "variable": "Type"
+                        }
+                    )
+                    fig.update_traces(mode="lines", hovertemplate=hover_template)
+                    fig.update_layout(
+                        xaxis_title="Aika",
+                        yaxis_title=y_label,
+                        hovermode="x unified",
+                        dragmode="pan",
+                        height=500,
+                        yaxis=dict(range=[0, y_max], fixedrange=True),
+                        xaxis=dict(fixedrange=False),
+                        showlegend=False
+                    )
+                    
+                    config = get_plotly_config()
+                    st.plotly_chart(fig, use_container_width=True, config=config)
+    else:
+        st.info("Lähetä CSV-tiedosto tarkastellaksesi reservituottoja.")
